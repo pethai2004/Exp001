@@ -23,7 +23,7 @@ class BaseWrap:
 		return: state with shape of list of observations
 		'''
 		s = self._reset()
-		return s
+		return self._prepS_fn(s)
 
 	def step(self, x, validate_action=True):
 		'''Take one step in an environment, preprocess action A and output state S at once
@@ -52,7 +52,7 @@ class BaseWrap:
 			x = flatten_shape(x)
 			assert len(x) == len(self.action_spec), 'input length do not match the given action spaces'
 		
-		if self.action_spec.is_discreate(): # check valid point since I use discrete action as float not int
+		if self.action_spec.is_discrete(): # check valid point since I use discrete action as float not int
 			x_dic = x[:len(self.action_spec.DISCRETE_SPACE)]
 			assert tf.experimental.numpy.allclose(
 				tf.cast(x_dic, dtype=tf.int32), x_dic, rtol=1e-09), 'discrete action do not "all close" ' # accept np array not tensor

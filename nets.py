@@ -4,12 +4,14 @@ from tensorflow import keras
 def create_simple_conv(input_dim, output_dim, actv='relu', output_actv=None, name='conv'):
     	
     ins = keras.layers.Input(shape=input_dim)
-    x = keras.layers.Conv2D(filters=64, kernel_size=(3, 3), strides=(1, 1), activation=actv, use_bias=True)(ins)
-    x = keras.layers.Conv2D(filters=48, kernel_size=(3, 3), strides=(2, 2), activation=actv, use_bias=True)(x)
+    x = keras.layers.Conv2D(filters=32, kernel_size=(4, 4), strides=(3, 3), activation=actv, use_bias=True)(ins)
+    x = keras.layers.Conv2D(filters=32, kernel_size=(4, 4), strides=(2, 2), activation=actv, use_bias=True)(x)
     x = keras.layers.Conv2D(filters=32, kernel_size=(3, 3), strides=(2, 2), activation=actv, use_bias=True)(x)
     x = keras.layers.Flatten()(x)
-    x = keras.layers.Dense(64, activation=actv)(x)
+    x = keras.layers.Dense(32, activation=actv)(x)
     out = keras.layers.Dense(output_dim, activation=output_actv)(x)
+
+    return keras.Model(ins, out)
 
     return keras.Model(ins, out)
 		

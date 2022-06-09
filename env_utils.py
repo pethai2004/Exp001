@@ -1,8 +1,8 @@
 import tensorflow as tf
 import gym
 import numpy as np
-from trajectory import *
 
+from trajectory import *
 def create_gym_action_spec(self):
         
     if isinstance(self.env.action_space, gym.spaces.Discrete):
@@ -26,3 +26,5 @@ def uniform_dis_action(branches, sum_axis=-1):
 
 def uniform_con_action(branches):
     return tf.random.normal((branches, ))
+
+

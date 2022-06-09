@@ -22,18 +22,18 @@ class BasePolicy:
 		self.clip_obs = clip_obs
 		self.clip_act = clip_act
 
-	def forward_policy(self, S):
+	def forward_policy(self, S, training=False):
 		'''Generate action A given state input S
 		Inputs:
 			S : numpy array or tensor in given state S 
 		Returns: 
 			action A
 		'''
-		A = self._forward_policy(S)
+		A = self._forward_policy(S, training=training)
 		return A
 
-	def forward_network(self, inputs):
-		return self._forward_network(inputs)
+	def forward_network(self, inputs, training=False):
+		return self._forward_network(inputs, training)
 
 	def fully_generated_action(self, inputs):
 		A = self.fully_generated_action(inputs)
@@ -54,9 +54,9 @@ class BasePolicy:
 		else:
 			self.network.set_weights(inputs)
 
-	def _forward_policy(self, inputs):
+	def _forward_policy(self, inputs, training=False):
 		raise NotImplementedError
-	def _forward_network(self, inputs):
+	def _forward_network(self, inputs, training=False):
 		raise NotImplementedError
 	def fully_generated_action(self, inputs):
 		raise NotImplementedError
@@ -70,10 +70,11 @@ class SimplePolicy(BasePolicy):
 		assert not (self.act_spec.action_type == ActionTYPE.MIXED), 'do not currently support mixed action space'
 		self.old_logits = []
 		
-	def _forward_policy(self, inputs):
+	def _forward_policy(self, inputs, training=False):
 			
-		reps = self._forward_network(inputs)
+		reps = self._forward_network(inputs, training=training)
 		reps = self._prep_logit(reps)
+		self.old_logits.append(reps)
 
 		draws = self.distribution.assign_logits(reps)
 		draws = self.distribution.sample()
@@ -81,12 +82,13 @@ class SimplePolicy(BasePolicy):
 		
 		return draws
 
-	def _forward_network(self, inputs):
-		assert (inputs.shape == self.obs_spec.OBSERVATION_SPACE)
+	def _forward_network(self, inputs, training=False):
+		# if not training:
+		# 	assert (inputs.shape == self.obs_spec.OBSERVATION_SPACE)
 		if len(inputs.shape) == len(self.obs_spec.OBSERVATION_SPACE): # if equal then add batch dimension to it
 			inputs = tf.expand_dims(inputs, 0)
 
-		return self.network(inputs)
+		return self.network(inputs, training=training)
 
 	def _prep_logit(self, inputs):
 		return inputs

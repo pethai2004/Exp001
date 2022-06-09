@@ -31,7 +31,7 @@ class ActionSpec:
 		elif con >= 1 and dic >= 1:
 			self.action_type = ActionTYPE.MIXED
 
-	def is_discreate(self):
+	def is_discrete(self):
 		'''This only check whether action has discrete space, not that it is purely discrete'''
 		if len(self.DISCRETE_SPACE) >=1:
 			return True
@@ -44,7 +44,7 @@ class ActionSpec:
 			return True
 		else:
 			return False
-			
+
 	def __len__(self):
 		return len(self.DISCRETE_SPACE) + self.CONTINUOUS_SPACE
 
@@ -87,7 +87,7 @@ class FullBuffer(NamedTuple("FullBuffer", [('step_type', tf.Tensor),
     def __len__(self):
         return len(self.step_type)
 
-class FullDatasetPPO(NamedTuple("FullBuffer", [('step_type', tf.Tensor),
+class FullDatasetPG(NamedTuple("FullBuffer", [('step_type', tf.Tensor),
                                                ('observations', tf.Tensor),
                                                ('returns', tf.Tensor),
                                                ('actions', tf.Tensor),
@@ -107,5 +107,5 @@ class FullDatasetPPO(NamedTuple("FullBuffer", [('step_type', tf.Tensor),
         advantage = tf.random.shuffle(self.advantage, seed=seed)
         value_pred = tf.random.shuffle(self.value_pred, seed=seed)
 
-        return FullDatasetPPO(step_type, observations, returns, actions, log_prob0, advantage, value_pred)
+        return FullDatasetPG(step_type, observations, returns, actions, log_prob0, advantage, value_pred)
 
