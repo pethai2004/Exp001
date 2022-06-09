@@ -201,6 +201,7 @@ def mean_and_std(x):
     elif isinstance(x, tf.Tensor): 
         m, std = tf.math.reduce_mean(x), tf.math.reduce_std(x)
     return m, std
+    
 def normalizing(x):
     m, std = mean_and_std(x)
     return (x - m) / std

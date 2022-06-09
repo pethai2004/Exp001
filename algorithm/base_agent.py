@@ -18,8 +18,8 @@ class BaseAgent:
         self.train_step_counter = tf.compat.v1.train.get_or_create_global_step()
         self.clip_obs = 10.
         self.normalize_obs = True
-        self.log_dir = None
-        
+        self.log_dir = 'run_train'
+
     def train(self, epoch=3):
         self._train(epoch)
 

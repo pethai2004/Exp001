@@ -10,6 +10,7 @@ from utils import Timer
 import gym 
 import tensorflow as tf
 import numpy as np
+from keras.utils.layer_utils import count_params  
 
 gym_env = gym.make("ALE/Adventure-v5")
 act_spec = ActionSpec(dis=(18, ), cont=0, action_type=ActionTYPE.DISCRETE)
@@ -26,12 +27,12 @@ times = Timer()
 # with times:
 #     results = GymRunner(wrapped, policy0, max_steps=10)
 
-test_VG = VanillaPG(wrapped, policy0, v_net, gamma=0.98, lam=0.95)
+test_VG = VanillaPG(wrapped, policy0, v_net, gamma=0.98, lam=0.95, max_trj=100)
 print('build ok')
 
 test_summary_writer = tf.summary.create_file_writer('run_VG/test0')
-with test_summary_writer.as_default() and times:
-    rs = test_VG.train(20)
+with test_summary_writer.as_default():
+    rs = test_VG.train(30)
 
 print('yes ok!')
 
