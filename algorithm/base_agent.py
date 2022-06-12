@@ -19,7 +19,8 @@ class BaseAgent:
         self.clip_obs = 10.
         self.normalize_obs = True
         self.log_dir = 'run_train'
-
+        self.grad_clip = None
+        
     def train(self, epoch=3):
         self._train(epoch)
 
@@ -55,6 +56,7 @@ class ActorCritic(BaseAgent):
         self.state_normalizer = RunningStat()
         self.shared_network = None
         self.value_opt = tf.keras.optimizers.SGD(self._value_lr, momentum=0.1, nesterov=False)
+        self.old_logits = None
 
         if self.shared_network is None and self.value_network is None:
             raise ValueError('if not using shared network, the value_network must be provided')
@@ -103,11 +105,11 @@ class ActorCritic(BaseAgent):
         v_predict = self.value_network(TRJ.observations)
 
         if compute_log_prob:
-            old_logits = tf.convert_to_tensor(self.policy.old_logits)
-            self.policy.distribution.assign_logits(old_logits)
+            self.old_logits = tf.convert_to_tensor(self.policy.old_logits) # old_logits in agent will not be deleted until next running trj
+            self.policy.distribution.assign_logits(self.old_logits)
             log_prob0 = self.policy.distribution.log_prob(action)
             #erase old_logits from policy.policy
-            self.policy.old_logits = []
+            self.policy.old_logits = [] 
         else:
             log_prob0 = tf.zeros_like(v_predict)
         

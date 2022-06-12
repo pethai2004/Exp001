@@ -92,9 +92,10 @@ class BaseWrap:
 
 class GymWrapper(BaseWrap):
 
-	def __init__(self, env, obs_spec=None, act_spec=None):
+	def __init__(self, env, obs_spec=None, act_spec=None, rescale_image=(120, 75)):
 
 		super().__init__(env=env, obs_spec=obs_spec, act_spec=act_spec)
+		self.rescale_image = rescale_image
 
 	def _reset(self):
 		s = self.env.reset()
@@ -115,7 +116,10 @@ class GymWrapper(BaseWrap):
 		return actions
 
 	def _prepS_fn(self, state):
-		return state / 255
+    		
+		#state = tf.image.resize(state, size=self.rescale_image)
+		#state = tf.image.rgb_to_grayscale(state)
+		return state 
 
 class UnityWrapper(BaseWrap):
 	'''Wrapper for Unity based environment'''

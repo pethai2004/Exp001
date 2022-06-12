@@ -1,25 +1,26 @@
 from base_agent import ActorCritic
 from runner import GymRunner
 from utils import *
+
 import tensorflow as tf
-from keras.utils.layer_utils import count_params  
+
 class VanillaPG(ActorCritic):
 
     def __init__(self, env, policy, value_network=None, gamma=0.90, max_trj=3000, summary=True, optimizer=None, 
-    grad_clip_norm=1., policy_lr=0.001, value_lr=0.01, use_gae=True, lam=0.9):
+            grad_clip_norm=1., policy_lr=0.001, value_lr=0.01, use_gae=True, lam=0.9):
         super().__init__(env, policy, value_network, gamma, summary, optimizer, grad_clip_norm, policy_lr, value_lr, use_gae, lam)
-        self.entropy_rate = 0.1
-        self.policy_l2_reg = 0.1
+        self.entropy_rate = 0.05
         self.kl_penalty = 0.0
         self.optimizer = tf.keras.optimizers.Adam(self._policy_lr)
         self.max_trj = max_trj
+        self.pol_iters = 80
+        self.value_loss_const = 0.5
 
     def _forward_trajectory(self, max_step=100):
         TRJ = GymRunner(self.env, self.policy, max_step)
         return TRJ
 
     def _train(self, epochs=30):
-
 
         for ep in range(epochs):
 
@@ -28,13 +29,14 @@ class VanillaPG(ActorCritic):
             var_to_train = self.value_network.trainable_variables + self.policy.network.trainable_variables
             assert var_to_train, 'no variable is initialized'
             
-            with tf.GradientTape() as tape:
-                v_loss_k = self.value_loss(DATA.observations, DATA.returns, training=True, summary=self.summary)
-                p_loss_k, log_prob1 = self.policy_loss(DATA.observations, DATA.actions, DATA.advantages)
-                LOSS = v_loss_k + p_loss_k
-            grads = tape.gradient(LOSS, var_to_train)
-            assert grads, 'gradient cannot be computed'
-            self.optimizer.apply_gradients(zip(grads, var_to_train))
+            for Epps in range(self.pol_iters):
+                with tf.GradientTape() as tape:
+                    v_loss_k = self.value_loss(DATA.observations, DATA.returns, training=True, summary=self.summary)
+                    p_loss_k, log_prob1 = self.policy_loss(DATA.observations, DATA.actions, DATA.advantages)
+                    LOSS = v_loss_k * self.value_loss_const + p_loss_k
+                grads = tape.gradient(LOSS, var_to_train)
+                assert grads, 'gradient cannot be computed'
+                self.optimizer.apply_gradients(zip(grads, var_to_train))
             
             if self.summary:
 
@@ -75,16 +77,16 @@ class VanillaPG(ActorCritic):
         else:
             ent = 0.
 
-        if self.policy_l2_reg > 0.:
+        if self._policy_reg > 0.:
             p_var_reg = (v for v in self.policy.network.trainable_weights if 'kernel' in v.name)
-            p_reg_loss = tf.nn.scale_regularization_loss([tf.nn.l2_loss(v) for v in p_var_reg]) * self.policy_l2_reg
+            p_reg_loss = tf.nn.scale_regularization_loss([tf.nn.l2_loss(v) for v in p_var_reg]) * self._policy_reg
             p_reg_loss = tf.debugging.check_numerics(p_reg_loss, 'p_reg_loss')
             tf.summary.scalar('p_reg_loss', p_reg_loss, self.train_step_counter)
             
         else:
             p_reg_loss = 0.   
 
-        total_p_loss = p_loss + ent * self.entropy_rate + p_reg_loss * self.policy_l2_reg
+        total_p_loss = p_loss + ent * self.entropy_rate + p_reg_loss * self._policy_reg
 
         if self.kl_penalty > 0.:
             raise NotImplementedError('not current support kl regularization for policy loss')

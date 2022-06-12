@@ -54,6 +54,9 @@ class BasePolicy:
 		else:
 			self.network.set_weights(inputs)
 
+	def get_num_params(self):
+		return self.get_variable.shape
+
 	def _forward_policy(self, inputs, training=False):
 		raise NotImplementedError
 	def _forward_network(self, inputs, training=False):
@@ -62,9 +65,14 @@ class BasePolicy:
 		raise NotImplementedError
 	def _scheduling_eps(self):
 		raise NotImplementedError
+	def save_model(self, dir_path='saved_policy/model'):
+		self.network.save(dir_path)
+	def load_model(self, dir_path):
+		self.network = keras.models.load_model(dir_path)
+		#TODO : assert the valid loaded model shape
 
 class SimplePolicy(BasePolicy):
-
+	'''A stochastic policy for PG algorithm'''
 	def __init__(self, network, obs_spec, act_spec, epsilon=1., clip_act=1., clip_obs=3., distribution=None):
 		super().__init__(network, obs_spec, act_spec, epsilon, clip_act, clip_obs, distribution)
 		assert not (self.act_spec.action_type == ActionTYPE.MIXED), 'do not currently support mixed action space'
@@ -75,7 +83,6 @@ class SimplePolicy(BasePolicy):
 		reps = self._forward_network(inputs, training=training)
 		reps = self._prep_logit(reps)
 		self.old_logits.append(reps)
-
 		draws = self.distribution.assign_logits(reps)
 		draws = self.distribution.sample()
 		assert len(draws.shape) == 1, 'draws dim must be 1'
@@ -92,4 +99,4 @@ class SimplePolicy(BasePolicy):
 
 	def _prep_logit(self, inputs):
 		return inputs
-	
+
