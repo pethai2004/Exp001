@@ -158,7 +158,7 @@ class TrustRegionPO(ActorCritic):
         norm_direction = norm_x(direction)
         norm_params = norm_x(self.parameters)
         
-        return norm_grad_p, norm_direction, norm_params, a, satisfies_LS
+        return pol_loss, norm_grad_p, norm_direction, norm_params, a, satisfies_LS
 
     def fim_hessian(self, vec):
         raise NotImplementedError('not support FIM')
@@ -216,15 +216,34 @@ class TrustRegionPO(ActorCritic):
     
             DATA = self.preprocess_data(max_trj=self.max_trj, validate_trj=True, compute_log_prob=True)
             #step_type, observations, returns, actions, log_prob0, advantage, value_pred
+            batch_p_l, batch_n_g, batch_n_d, batch_n_p, batch_a_k, batch_st_ep = [], [], [], [], [], []
+            batch_v_l, batch_v_g= [], []
             for po_e in range(self.max_policy_epoch):
-                n_g, n_d, n_p, a_k, st_ep = self.forward_trpo(DATA.observations, DATA.actions, DATA.advantages, DATA.log_prob0)
+                p_l, n_g, n_d, n_p, a_k, st_ep = self.forward_trpo(DATA.observations, DATA.actions, DATA.advantages, DATA.log_prob0)
+                
+                batch_p_l.append(p_l)
+                batch_n_g.append(n_g)
+                batch_n_d.append(n_d)
+                batch_n_p.append(n_p)
+                batch_a_k.append(a_k)
+                batch_st_ep.append(st_ep)
 
             for vo_e in range(self.max_value_epoch):
                 value_loss, value_grad = self.update_value(DATA.observations, DATA.returns)
-
+                batch_v_l.append(value_loss)
+                batch_v_g.append(norm_x(value_grad))
+                
             self.train_step_counter.assign_add(1)
-            
 
+            tf.summary.scalar('mean_policy_loss', tf.reduce_mean(batch_n_g), self.train_step_counter)
+            tf.summary.scalar('norm_grad_policy', tf.reduce_mean(batch_n_g), self.train_step_counter)
+            tf.summary.scalar('norm_direction_policy', tf.reduce_mean(batch_n_d), self.train_step_counter)
+            tf.summary.scalar('norm_params_policy', tf.reduce_mean(batch_n_p), self.train_step_counter)
+            tf.summary.scalar('step_size,', tf.reduce_mean(batch_a_k), self.train_step_counter)
+
+            tf.summary.scalar('mean_value_loss', tf.reduce_mean(batch_v_l), self.train_step_counter)
+            tf.summary.scalar('norm_grad_value,', tf.reduce_mean(batch_v_g), self.train_step_counter)
+            
     def _forward_trajectory(self, max_step=100):
         TRJ = GymRunner(self.env, self.policy, max_step)
         return TRJ
