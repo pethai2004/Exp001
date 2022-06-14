@@ -5,6 +5,10 @@ import numpy as np
 import tensorflow as tf
 
 from utils import *
+from base_agent import ActorCritic
+from distributions import *
+from runner import GymRunner
+
 EPS = 0.00000001
 
 def conjugate_gradient(Ax, b, max_iters=100, tol=0.001):
@@ -28,137 +32,156 @@ def conjugate_gradient(Ax, b, max_iters=100, tol=0.001):
 
     return x
 
-Results = namedtuple('Results_TRJ', ['state', 'actions', 'returns', 'advantages', 'values','log_prob'])
+class TrustRegionPO(ActorCritic):
 
-class TRPO:
-
-    def __init__(self, env, policy, env_spec, value_network=None, preprocess_fn=None, distribution=None, 
-        delta=1.0, max_rollouts=4500, value_lr=0.01, dir_sum=None, use_line_search=True):
-
-        self.env = env 
-        self.env_spec = env_spec
-        self.preprocess_fn = preprocess_fn
-        self.distribution = distribution
-
-        self.old_logits = None
-        self.policy = policy
-        self.value_network = value_network
-        self.value_lr = value_lr
-        self.value_opt = tf.keras.optimizers.Adam(value_lr)
-        self.parameters = self.policy.get_flat_var()
-        self.params_shape = self.policy.get_flat_shape()
+    def __init__(self, env, policy, value_network=None, gamma=0.90, max_trj=3000, summary=True, delta=0.1, use_line_search=20,
+                max_cg=40, tol_cg=0.4, damping=0, assign_first=True, optimizer=None, grad_clip_norm=1., policy_lr=0.009, value_lr=0.01, use_gae=True, lam=0.9):
+        '''Trust Region Policy Optimization instance
+        Input: 
+            delta (float) : KL-constraint for TRPO
+            use_line_search (int) : max number of line search, if 0 then no line search is used.
+            max_cg (int) : max number of for conjugate gradient iterations
+            tol_cg (float) : (0 - 1) the decay step size in line search
+            assign_first (bool) : whether the line search should pick the first alpha once it found the good step size
+                                , if False then it will keep store step size alpha and continue reaching its number of max line search and then pick from this set.
+                                For faster line search use assign_first=True, if want the best use assign_first=False
+        '''
+        super().__init__(env, policy, value_network, gamma, summary, optimizer, grad_clip_norm, policy_lr, value_lr, use_gae, lam)
+        self.parameters = self.policy.get_variable()
+            
         self.delta = delta
-        self.gamma = 0.99
-        self.lam = 0.92
         self.max_value_epoch = 50
-        self.max_rollouts = max_rollouts
-        self.dir_sum = dir_sum
+        self.max_policy_epoch = 50
+        self.max_trj = max_trj
         self.use_line_search = use_line_search
-        self.state_normalizer = RunningStat()
+        self.max_cg = max_cg
+        self.tol_cg = tol_cg
+        self.damping = damping
+        self.assign_first = assign_first
+        self.entropy_rate = 0.1
 
-    def run_trj(self, max_steps):
-
-        TRJ, logits_trj = None
-        acts = tf.reshape(TRJ.actions, (-1, 1))
-        log_prob0 = tf.reshape(self.policy.distribution.ref_distribution(logits_trj).log_prob(acts), (-1, 1))
-        v_predict = tf.stop_gradient(self.value_network(TRJ.observations))
-        rewards = TRJ.rewards
-
-        ADV, returns = compute_adv_from_Buff(TRJ, v_predict, gamma=self.gamma, lamda=self.lam)
-        ADV = tf.cast(tf.expand_dims(tf.concat(ADV, axis=0), -1), dtype=tf.float32)
-
-        ADV = tf.debugging.check_numerics(ADV, 'ADV')
-        returns = tf.cast(tf.expand_dims(tf.concat(returns, axis=0), -1), dtype=tf.float32)
-
-        ADV = normalize_advantage(ADV)
-        returns = normalize_advantage(returns)
-        obs = TRJ.observations
-        
-        return Results(obs, acts, returns, ADV, v_predict, log_prob0)
-		
     def update_value(self, S, R):
-
-        if not len(R.shape) >=2:
-            R = tf.reshape(R, (-1, 1))
-        assert len(S.shape) >=2, 's must have batch dim'
-        assert len(R.shape) >=2, 'r must have batch dim'
-
+        '''is update independently from policy updation'''
         with tf.GradientTape() as tape:
-            l_value = tf.reduce_mean((self.value_network(S) - R) ** 2)
+            l_value = self.value_loss(S_buf=S, R_buf=R, training=True)
         g_value = tape.gradient(l_value, self.value_network.trainable_variables)
         self.value_opt.apply_gradients(zip(g_value, self.value_network.trainable_variables))
-        
+
         return l_value, g_value
 
     def policy_loss(self, S, A, ADV, log_prob0):
-        
-        log_prob1 = self.policy.get_log_prob(S, A)
-        surr = tf.math.exp(log_prob1 - log_prob0) * ADV
-        return - tf.reduce_mean(surr)
+        'surrogate objective of policy gradient'
+        logits1 = self.policy.forward_network(S)
 
-    def forward_trpo(self, S, A, ADV, log_prob0, direct_hessian=True, max_cg=20, tol_cg=0.001):
+        if len(self.env.action_spec.DISCRETE_SPACE) == 1:
+            logits1 = tf.expand_dims(logits1, 1) 
+        self.policy.distribution.assign_logits(logits1)
+        log_prob1 = self.policy.distribution.log_prob(A) 
+
+        assert log_prob1.shape == ADV.shape
+        ratio = tf.math.exp(log_prob1 - log_prob0)
+        p_loss = - tf.reduce_mean(ratio * ADV)
+        p_loss = tf.debugging.check_numerics(p_loss, 'p_loss')
+        
+        ent = tf.reduce_mean(self.policy.distribution.entropy()) if self.entropy_rate > 0 else 0.
+
+        if self._policy_reg > 0.:
+            p_var_reg = (v for v in self.policy.network.trainable_weights if 'kernel' in v.name)
+            p_reg_loss = tf.nn.scale_regularization_loss([tf.nn.l2_loss(v) for v in p_var_reg]) * self._policy_reg
+            p_reg_loss = tf.debugging.check_numerics(p_reg_loss, 'p_reg_loss')
+        else:
+            p_reg_loss = 0.  
+
+        all_p_loss = p_loss + ent * self.entropy_rate + p_reg_loss * self._policy_reg
+        
+        return all_p_loss, logits1, p_loss, ent, p_reg_loss
+
+    def forward_trpo(self, S, A, ADV, log_prob0, direct_hessian=True):
+        var_policy = self.policy.network.trainable_variables
+        assert var_policy, 'no variable has been initialized for given policy.network'
         
         with tf.GradientTape() as tape:
-            p_loss = self.policy_loss(S, A, ADV, log_prob0) # 'g' policy grad of loss with respect to params
-        p_loss = tf.debugging.check_numerics(p_loss, 'p_loss')
-        gk = tape.gradient(p_loss, self.policy.network.trainable_variables)
+            pol_loss, logits1_k, p_l, e_l, r_l = self.policy_loss(S, A, ADV, log_prob0) # 'g' policy grad of loss with respect to params
+        gk = tape.gradient(pol_loss, var_policy)
+        assert None not in gk, 'cannot compute gradient'
         gk = flatten_shape(gk) 
-        gk = tf.debugging.check_numerics(gk, 'gradient_policy')
-
-        HVX = lambda x : self.direct_hessian(S, A, ADV, log_prob0, x, damp=0)
+        gk = tf.debugging.check_numerics(gk, 'gk_forward_trpo')
+        
+        HVX = lambda x_vec : self.direct_hessian(s_batch=S, vec_batch=x_vec, damp=self.damping)
         if direct_hessian:
             Ftt = HVX
         else:
             raise NotImplementedError('not support FIM')
 
-        x = conjugate_gradient(Ftt, gk, max_iters=max_cg, tol=tol_cg) # solve Hx = g
+        x = conjugate_gradient(Ftt, gk, max_iters=self.max_cg, tol=self.tol_cg) # solve Hx = g
         x = tf.debugging.check_numerics(x, 'cg_x')
 
         direction = tf.cast(tf.math.sqrt(2 * self.delta / np.dot(x, Ftt(x))), dtype=tf.float32) * x
         direction = tf.debugging.check_numerics(direction, 'direction')
 
-        if self.use_line_search:
-                
-            def line_search(alpha=1., tol=0.9, max_ls=10):
+        if self.use_line_search > 0:
 
-                self.policy.assign_flat_var(self.parameters + alpha * direction)
+            def line_search(alpha=1., tol=self.tol_cg, max_ls=self.use_line_search):
+                # add first param0, loop though and if 'goodness' is better then  use it in place, after end max_iter, pick the best alpha from it. 
+                # if failed then return alpha = 1, DO : use 'satisfied' for counting iters line_search that it find line search.
+                id_alpha = alpha
+                best_r = None
+                self.policy.assign_variable(self.parameters + alpha * direction, from_flat=True)
                 eval0, kl0 = self.evals(s=S, a=A, adv=ADV, lp0=log_prob0)
-                kl0 = tf.reduce_mean(kl0)
 
-                for ls_T in range(max_ls):
+                satisfied = 0
+                for ls_T in range(self.use_line_search):
                     alpha *= tol
                     x1 = self.parameters + alpha * direction
-                    self.policy.assign_flat_var(x1)
+                    self.policy.assign_variable(x1, from_flat=True)
                     eval1, kl1 = self.evals(s=S, a=A, adv=ADV, lp0=log_prob0)
-                    kl1 = tf.reduce_mean(kl1)
 
-                    if eval1 >= eval0 and kl0<=kl1:
-                        return alpha
-                    
+                    satisfied += 1
+                    if eval0 >= eval1 and kl0 >= kl1:
+                        if self.assign_first:
+                            return alpha, satisfied
+                        else:
+                            id_alpha = alpha 
+                            best_r = np.array([eval1, kl1])
+                            if ls_T >= max_ls -1:
+                                return id_alpha, satisfied # satisfied will always equal to self.use_line_search
                     if ls_T  >=  max_ls - 1:
-                        self.policy.assign_flat_var(self.parameters) # no improve, set back to original
-                        return 1.
-            a = line_search(alpha=1., tol=0.9, max_ls=10)
-        
+                        return 1., 0
+
+            a, satisfies_LS = line_search(alpha=1., tol=0.9, max_ls=10)
         else:	
             a = 1. # not using line search
         self.parameters = self.parameters + a * direction
-        self.policy.assign_flat_var(self.parameters)
+        self.policy.assign_variable(self.parameters, from_flat=True)
+
+        norm_grad_p = norm_x(gk)
+        norm_direction = norm_x(direction)
+        norm_params = norm_x(self.parameters)
+        
+        return norm_grad_p, norm_direction, norm_params, a, satisfies_LS
 
     def fim_hessian(self, vec):
         raise NotImplementedError('not support FIM')
 
-    def kl_div(self, s):
-            
-        logit1 = self.policy.network(s)
-        logit1_dist = self.policy.distribution.ref_distribution(logit1)
-        logit0_dist = self.policy.distribution.ref_distribution(self.old_logits)
-        kl_t = logit1_dist.kl_divergence(logit0_dist)
+    def kl_div(self, params0=None, params1=None, obs=None):
+        if obs is not None and params1 is None:
+            params1 = self.policy.forward_network(obs, training=True)
+            #self.policy.distribution.assign_logits(params1)
+
+        if self.env.action_spec.is_discrete():
+            kl_t = Cat_KL(params0, params1)
+        elif self.env.action_spec.is_continuous():
+            kl_t = Gauss_KL(*params0, *params1,)
+        else:
+            if not isinstance(self.policy.distribution, [DiscreteDistrib, ContinuousDistrib]):
+                raise NotImplementedError('not support calculating kl from given BasePolicy.distribution')
+    
         kl_t = tf.debugging.check_numerics(kl_t, 'kl_0')
+        
         return kl_t
 
-    def direct_hessian(self, s_batch, a_batch, adv_batch, lp_batch, vec_batch, damp=0):
-        '''direct computation of Hessian
+    def direct_hessian(self, s_batch, vec_batch, damp=0): 
+        '''direct computation of Hessian vector product
         params:
             vec_batch: any vector to be multiplied with hessian
         '''
@@ -166,8 +189,10 @@ class TRPO:
 
         with tf.GradientTape() as tape_2:
             with tf.GradientTape() as tape_1:
-                kl_k = self.kl_div(s_batch)
-            g = flatten_shape(tape_1.gradient(kl_k, params)) # g of kl
+                kl_k = self.kl_div(obs=s_batch, params0=self.old_logits) ### gradient g of kl-divergence not policy gradient 
+            print('kl_divergence is ::::', kl_k)
+            g = tape_1.gradient(kl_k, params)
+            g = flatten_shape(g) 
             g = tf.reduce_sum(g * vec_batch)
 
         h = tape_2.gradient(g, params)
@@ -181,19 +206,25 @@ class TRPO:
 
     def evals(self, s, a, adv, lp0):
         '''evaluate line search step, return rewards and kl-divergence'''
-        loss_eval = self.policy_loss(s, a, adv, lp0)
-        kl_eval = self.kl_div(s=s)
+        loss_eval, logits_new, *arg = self.policy_loss(s, a, adv, lp0)
+        kl_eval = tf.reduce_mean(self.kl_div(params0=self.old_logits, params1=logits_new))
         return loss_eval, kl_eval
 
-    def train(self, epoch=3):
+    def _train(self, epochs=30):
+    
+        for ep in range(epochs):
+    
+            DATA = self.preprocess_data(max_trj=self.max_trj, validate_trj=True, compute_log_prob=True)
+            #step_type, observations, returns, actions, log_prob0, advantage, value_pred
+            for po_e in range(self.max_policy_epoch):
+                n_g, n_d, n_p, a_k, st_ep = self.forward_trpo(DATA.observations, DATA.actions, DATA.advantages, DATA.log_prob0)
 
-        for Ep in range(epoch):
-            Results = self.run_trj(max_steps=self.max_rollouts)
+            for vo_e in range(self.max_value_epoch):
+                value_loss, value_grad = self.update_value(DATA.observations, DATA.returns)
+
+            self.train_step_counter.assign_add(1)
             
-            S_b, A_b, R_b, Adv_b, V_b, lp_b = Results
 
-            #p_grad = self.policy_grad(S=s_b, A=a_b, ADV=adv_b, log_prob0=lp_b)
-            self.forward_trpo(S_b, A_b, Adv_b, lp_b)
-
-            for _ in range(self.max_value_epoch):
-                value_loss = self.update_value(S_b, R_b)
+    def _forward_trajectory(self, max_step=100):
+        TRJ = GymRunner(self.env, self.policy, max_step)
+        return TRJ
