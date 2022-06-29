@@ -3,6 +3,7 @@ from distributions import *
 from trajectory import *
 
 import time
+
 def create_distribution(act_spec: ActionSpec):
     dic = len(act_spec.DISCRETE_SPACE) # length of discrete branches
     con = act_spec.CONTINUOUS_SPACE
@@ -44,6 +45,9 @@ def assign_from_flat(network, params):
 def flatten_shape(xs):
     return tf.concat([tf.reshape(x, (-1,)) for x in xs], axis=0)
 
+def flatten_shape_batch(xs):
+    return  tf.reshape(xs, (xs.shape[0], intprod(xs.shape[1:])))
+    
 def clip_gradient(grad_and_var, max_norm):
     '''cliping multiple gradient'''   	
     clipped_grad = []
@@ -67,6 +71,13 @@ def var_shape(x):
     out = x.get_shape().as_list()
     assert all(isinstance(a, int) for a in out)
     return out
+
+def reward_from_trj(trj):
+    slices = get_slice_from_step_type(trj.step_type)
+    R_hist = []
+    for i in slices:
+        R_hist.append(np.sum(trj.rewards[i]))
+    return tf.convert_to_tensor(R_hist)
 
 class Timer(object):
     

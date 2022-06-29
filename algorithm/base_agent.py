@@ -1,6 +1,6 @@
 import tensorflow as tf
 from utils import clip_gradient, compute_adv_from_Buff, RunningStat, mean_and_std, normalizing, normalize_advantage
-from utils import flatten_shape
+from utils import flatten_shape, reward_from_trj
 from trajectory import FullDatasetPG, FullBuffer
 
 class BaseAgent:
@@ -15,15 +15,18 @@ class BaseAgent:
         self.summary = summary
         self.optimizer = optimizer
         self.grad_clip_norm = grad_clip_norm
-        self.train_step_counter = tf.compat.v1.train.get_or_create_global_step()
+        self.train_step_counter = tf.Variable(0, dtype=tf.int64, name='train_step')
         self.clip_obs = 10.
         self.normalize_obs = True
         self.log_dir = 'run_train'
         self.grad_clip = None
+        self.model_save_dir = ''
+        self.stack = 4
         
     def train(self, epoch=3):
         self._train(epoch)
-
+        print('<>------------------------TRAIN_STEP--------------------------<>')
+        
     def _train(self):
         raise NotImplementedError
 
@@ -49,8 +52,8 @@ class ActorCritic(BaseAgent):
         
         self._policy_lr = policy_lr
         self._value_lr = value_lr
-        self._policy_reg = 0.
-        self._value_reg = 0.
+        self._policy_reg = 0.05
+        self._value_reg = 0.05
         self.use_gae = use_gae
         self.lam = lam
         self.state_normalizer = RunningStat()
@@ -78,17 +81,17 @@ class ActorCritic(BaseAgent):
         assert trj.rewards.shape == (num_steps, 1)
         assert trj.actions.shape == (num_steps, len(self.env.action_spec))
 
-    def preprocess_data(self, max_trj:int=100, validate_trj=True, compute_log_prob=True):
+    def preprocess_data(self, max_trj:int=100, validate_trj=True, compute_log_prob=True, summary_reward=True):
 
         TRJ = self._forward_trajectory(max_trj)
         if validate_trj:
             self.validate_trajectory(TRJ, max_trj)
         obs = TRJ.observations
 
-        if self.clip_obs and self.normalize_obs > 0.:
+        if self.clip_obs and self.normalize_obs:
             self.state_normalizer.add(flatten_shape(obs))
             obs_mean, obs_std = self.state_normalizer.get_mean(), self.state_normalizer.get_std()
-            if tf.math.is_nan(obs_std):
+            if tf.math.is_nan(obs_std): # first epoch of data
                 obs_std = tf.math.reduce_std(obs)
                 
             obs = tf.clip_by_value(obs, - self.clip_obs, self.clip_obs)
@@ -101,9 +104,9 @@ class ActorCritic(BaseAgent):
             raise NotImplementedError('not support mixed action space yet for VG algorithm')
         else:
             action = TRJ.actions
-
+    
         v_predict = self.value_network(TRJ.observations)
-
+    
         if compute_log_prob:
             self.old_logits = tf.convert_to_tensor(self.policy.old_logits) # old_logits in agent will not be deleted until next running trj
             self.policy.distribution.assign_logits(self.old_logits)
@@ -112,7 +115,7 @@ class ActorCritic(BaseAgent):
             self.policy.old_logits = [] 
         else:
             log_prob0 = tf.zeros_like(v_predict)
-        
+            
         if self.use_gae:
             advs, returns = compute_adv_from_Buff(TRJ, v_pred=v_predict, gamma=self.gamma, lam=self.lam)
         else:
@@ -121,6 +124,9 @@ class ActorCritic(BaseAgent):
         advs = normalize_advantage(advs) #TODO: delete normalize_advantage and use normalizing instead since it is the same
         returns = normalize_advantage(advs)
         
+        if summary_reward:
+            tf.summary.scalar('raw_reward', tf.reduce_mean(reward_from_trj(TRJ)), self.train_step_counter)
+
         return FullDatasetPG(TRJ.step_type, obs, returns, action, log_prob0, advs, v_predict)
         
     def value_loss(self, S_buf, R_buf, training=True, summary=True):

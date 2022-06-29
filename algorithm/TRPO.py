@@ -11,7 +11,7 @@ from runner import GymRunner
 
 EPS = 0.00000001
 
-def conjugate_gradient(Ax, b, max_iters=100, tol=0.001):
+def conjugate_gradient(Ax, b, max_iters=100, tol=0.001, CG_time_step=0):
     'A is (S++)'
     x = np.zeros_like(b)
     r = copy.deepcopy(b)  
@@ -23,19 +23,21 @@ def conjugate_gradient(Ax, b, max_iters=100, tol=0.001):
         alpha = r_dot_old /( np.dot(p, z) + EPS)
         x += alpha * p
         r -= alpha * z
+        CG_time_step+=1
         if tol >= np.linalg.norm(r):
-            return x
+            tf.summary.scalar('cg_time_elasp', CG_time_step, CG_time_step)
+            return x, CG_time_step
         
         r_dot_new = np.dot(r, r)
         p = r + (r_dot_new / (r_dot_old + EPS)) * p
         r_dot_old = r_dot_new
 
-    return x
+    return x, CG_time_step
 
 class TrustRegionPO(ActorCritic):
 
-    def __init__(self, env, policy, value_network=None, gamma=0.90, max_trj=3000, summary=True, delta=0.1, use_line_search=20,
-                max_cg=40, tol_cg=0.4, damping=0, assign_first=True, optimizer=None, grad_clip_norm=1., policy_lr=0.009, value_lr=0.01, use_gae=True, lam=0.9):
+    def __init__(self, env, policy, value_network=None, gamma=0.99, max_trj=3000, summary=True, delta=2., use_line_search=20,
+                max_cg=20, tol_cg=0.4, damping=0, assign_first=True, optimizer=None, grad_clip_norm=1., policy_lr=0.009, value_lr=0.01, use_gae=True, lam=0.9):
         '''Trust Region Policy Optimization instance
         Input: 
             delta (float) : KL-constraint for TRPO
@@ -50,8 +52,8 @@ class TrustRegionPO(ActorCritic):
         self.parameters = self.policy.get_variable()
             
         self.delta = delta
-        self.max_value_epoch = 50
-        self.max_policy_epoch = 50
+        self.max_value_epoch = 80
+        self.max_policy_epoch = 80
         self.max_trj = max_trj
         self.use_line_search = use_line_search
         self.max_cg = max_cg
@@ -59,6 +61,8 @@ class TrustRegionPO(ActorCritic):
         self.damping = damping
         self.assign_first = assign_first
         self.entropy_rate = 0.1
+        self.k_train_step_counter =  tf.compat.v1.train.get_or_create_global_step()
+        self.step_runner = tf.compat.v1.train.get_or_create_global_step()
 
     def update_value(self, S, R):
         '''is update independently from policy updation'''
@@ -108,15 +112,26 @@ class TrustRegionPO(ActorCritic):
         gk = tf.debugging.check_numerics(gk, 'gk_forward_trpo')
         
         HVX = lambda x_vec : self.direct_hessian(s_batch=S, vec_batch=x_vec, damp=self.damping)
+        # jax : grad(grad(f).dot(v))
         if direct_hessian:
             Ftt = HVX
         else:
             raise NotImplementedError('not support FIM')
 
-        x = conjugate_gradient(Ftt, gk, max_iters=self.max_cg, tol=self.tol_cg) # solve Hx = g
-        x = tf.debugging.check_numerics(x, 'cg_x')
+        if self.max_cg == 0: # not using cg, fall back to solving generic system of equation
+            raise NotImplementedError
 
-        direction = tf.cast(tf.math.sqrt(2 * self.delta / np.dot(x, Ftt(x))), dtype=tf.float32) * x
+        x, step_cg = conjugate_gradient(Ftt, gk, max_iters=self.max_cg, tol=self.tol_cg) # solve Hx = g
+        print('step_conjugate : ', step_cg)
+        print('x_solve : ', x)
+        x = tf.debugging.check_numerics(x, 'cg_x')
+        tf.summary.scalar('norm_solved_x', norm_x(x), self.k_train_step_counter)
+        denom = np.dot(x, Ftt(x))
+        print('donominator : ', denom)
+        denom = tf.debugging.check_numerics(denom, 'denom')
+        sqrt = tf.math.sqrt(2 * self.delta / denom)
+        sqrt = tf.debugging.check_numerics(sqrt, 'sqrt')
+        direction = tf.cast(sqrt, dtype=tf.float32) * x
         direction = tf.debugging.check_numerics(direction, 'direction')
 
         if self.use_line_search > 0:
@@ -124,12 +139,11 @@ class TrustRegionPO(ActorCritic):
             def line_search(alpha=1., tol=self.tol_cg, max_ls=self.use_line_search):
                 # add first param0, loop though and if 'goodness' is better then  use it in place, after end max_iter, pick the best alpha from it. 
                 # if failed then return alpha = 1, DO : use 'satisfied' for counting iters line_search that it find line search.
-                id_alpha = alpha
-                best_r = None
                 self.policy.assign_variable(self.parameters + alpha * direction, from_flat=True)
                 eval0, kl0 = self.evals(s=S, a=A, adv=ADV, lp0=log_prob0)
-
+                id_alpha = (alpha, eval0, kl0) # (alpha, loss, kl)
                 satisfied = 0
+
                 for ls_T in range(self.use_line_search):
                     alpha *= tol
                     x1 = self.parameters + alpha * direction
@@ -141,10 +155,12 @@ class TrustRegionPO(ActorCritic):
                         if self.assign_first:
                             return alpha, satisfied
                         else:
-                            id_alpha = alpha 
-                            best_r = np.array([eval1, kl1])
+                            if eval1 <= id_alpha[1] and kl1 <= id_alpha[2]:
+                                id_alpha = (alpha, eval1, kl1)
+
                             if ls_T >= max_ls -1:
-                                return id_alpha, satisfied # satisfied will always equal to self.use_line_search
+                                # return id_alpha[0] is the best
+                                return id_alpha[0], satisfied # satisfied will always equal to self.use_line_search
                     if ls_T  >=  max_ls - 1:
                         return 1., 0
 
@@ -154,9 +170,11 @@ class TrustRegionPO(ActorCritic):
         self.parameters = self.parameters + a * direction
         self.policy.assign_variable(self.parameters, from_flat=True)
 
-        norm_grad_p = norm_x(gk)
-        norm_direction = norm_x(direction)
-        norm_params = norm_x(self.parameters)
+        norm_grad_p = tf.norm(gk)
+        norm_direction = tf.norm(direction)
+        norm_params = tf.norm(self.parameters)
+        
+        tf.summary.scalar('step_cg_', step_cg, self.k_train_step_counter)
         
         return pol_loss, norm_grad_p, norm_direction, norm_params, a, satisfies_LS
 
@@ -190,7 +208,8 @@ class TrustRegionPO(ActorCritic):
         with tf.GradientTape() as tape_2:
             with tf.GradientTape() as tape_1:
                 kl_k = self.kl_div(obs=s_batch, params0=self.old_logits) ### gradient g of kl-divergence not policy gradient 
-            print('kl_divergence is ::::', kl_k)
+                kl_k = tf.reduce_mean(kl_k)
+                
             g = tape_1.gradient(kl_k, params)
             g = flatten_shape(g) 
             g = tf.reduce_sum(g * vec_batch)
@@ -201,13 +220,17 @@ class TrustRegionPO(ActorCritic):
 
         if damp>0:
             h += damp * vec_batch
-
-        return h
+        return tf.linalg.diag(h)
 
     def evals(self, s, a, adv, lp0):
         '''evaluate line search step, return rewards and kl-divergence'''
-        loss_eval, logits_new, *arg = self.policy_loss(s, a, adv, lp0)
+        loss_eval, logits_new, _, ent, _ = self.policy_loss(s, a, adv, lp0)
         kl_eval = tf.reduce_mean(self.kl_div(params0=self.old_logits, params1=logits_new))
+
+        tf.summary.scalar('eval_loss', loss_eval, self.k_train_step_counter)
+        tf.summary.scalar('eval_kl', kl_eval, self.k_train_step_counter)
+        tf.summary.scalar('eval_entropy', ent, self.k_train_step_counter)
+
         return loss_eval, kl_eval
 
     def _train(self, epochs=30):
@@ -218,32 +241,25 @@ class TrustRegionPO(ActorCritic):
             #step_type, observations, returns, actions, log_prob0, advantage, value_pred
             batch_p_l, batch_n_g, batch_n_d, batch_n_p, batch_a_k, batch_st_ep = [], [], [], [], [], []
             batch_v_l, batch_v_g= [], []
+
             for po_e in range(self.max_policy_epoch):
+
                 p_l, n_g, n_d, n_p, a_k, st_ep = self.forward_trpo(DATA.observations, DATA.actions, DATA.advantages, DATA.log_prob0)
                 
-                batch_p_l.append(p_l)
-                batch_n_g.append(n_g)
-                batch_n_d.append(n_d)
-                batch_n_p.append(n_p)
-                batch_a_k.append(a_k)
-                batch_st_ep.append(st_ep)
-
+                tf.summary.scalar('policy_loss_k', p_l, self.k_train_step_counter)
+                tf.summary.scalar('policy_grad_norm_k', n_g, self.k_train_step_counter)
+                tf.summary.scalar('norm_direction_k', n_d, self.k_train_step_counter)
+                tf.summary.scalar('norm_params_k', n_d, self.k_train_step_counter)
+                tf.summary.scalar('step_size_TRPO_k', a_k, self.k_train_step_counter)
+                tf.summary.scalar('step_linesearch_count_k', st_ep, self.k_train_step_counter)
+                self.k_train_step_counter.assign_add(1)
+            
             for vo_e in range(self.max_value_epoch):
                 value_loss, value_grad = self.update_value(DATA.observations, DATA.returns)
-                batch_v_l.append(value_loss)
-                batch_v_g.append(norm_x(value_grad))
                 
             self.train_step_counter.assign_add(1)
+            self.policy.save_model()
 
-            tf.summary.scalar('mean_policy_loss', tf.reduce_mean(batch_n_g), self.train_step_counter)
-            tf.summary.scalar('norm_grad_policy', tf.reduce_mean(batch_n_g), self.train_step_counter)
-            tf.summary.scalar('norm_direction_policy', tf.reduce_mean(batch_n_d), self.train_step_counter)
-            tf.summary.scalar('norm_params_policy', tf.reduce_mean(batch_n_p), self.train_step_counter)
-            tf.summary.scalar('step_size,', tf.reduce_mean(batch_a_k), self.train_step_counter)
-
-            tf.summary.scalar('mean_value_loss', tf.reduce_mean(batch_v_l), self.train_step_counter)
-            tf.summary.scalar('norm_grad_value,', tf.reduce_mean(batch_v_g), self.train_step_counter)
-            
     def _forward_trajectory(self, max_step=100):
-        TRJ = GymRunner(self.env, self.policy, max_step)
+        TRJ = GymRunner(self.env, self.policy, max_step, self.step_runner )
         return TRJ

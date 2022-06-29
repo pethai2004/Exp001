@@ -62,13 +62,14 @@ class BaseWrap:
 				self.clip_action, -self.clip_action)
 		return x
 
-	def random_self_action(self, validate_action=True):
+	def random_self_action(self, validate_action=True, rs=10):
 		'''Use for trivial testing environment run correctly'''
-
-		dis_a = uniform_dis_action(self.action_spec.DISCRETE_SPACE)
-		con_a = uniform_con_action(self.action_spec.CONTINUOUS_SPACE)
-		rand_a = tf.concat([dis_a, con_a], axis=-1)
-		self.step(rand_a, validate_action)
+		_ = self.reset()
+		for i in range(rs):
+			dis_a = uniform_dis_action(self.action_spec.DISCRETE_SPACE)
+			con_a = uniform_con_action(self.action_spec.CONTINUOUS_SPACE)
+			rand_a = tf.concat([dis_a, con_a], axis=-1)
+			_ = self.step(rand_a, validate_action)
 
 	def _reset(self):
 		raise NotImplementedError
@@ -92,7 +93,7 @@ class BaseWrap:
 
 class GymWrapper(BaseWrap):
 
-	def __init__(self, env, obs_spec=None, act_spec=None, rescale_image=(120, 75)):
+	def __init__(self, env, obs_spec=None, act_spec=None, rescale_image=None):
 
 		super().__init__(env=env, obs_spec=obs_spec, act_spec=act_spec)
 		self.rescale_image = rescale_image
@@ -102,7 +103,7 @@ class GymWrapper(BaseWrap):
 		return s
 
 	def _step(self, actions):
-    		
+    	
 		assert not self.action_spec.is_continuous(), 'action is not discrete, cannot transform it'
 		disc_action = actions.numpy().astype(np.int32)[0]
 		S_t, R_t, is_done_t, info = self.env.step(disc_action)
@@ -116,10 +117,13 @@ class GymWrapper(BaseWrap):
 		return actions
 
 	def _prepS_fn(self, state):
-    		
-		#state = tf.image.resize(state, size=self.rescale_image)
-		#state = tf.image.rgb_to_grayscale(state)
+		if self.rescale_image:
+			# env need to output image
+			#state = state / 255.
+			state = tf.image.resize(state, size=self.rescale_image)
+			state = tf.image.rgb_to_grayscale(state) / 255
 		return state 
+
 
 class UnityWrapper(BaseWrap):
 	'''Wrapper for Unity based environment'''

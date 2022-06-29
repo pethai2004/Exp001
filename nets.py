@@ -1,20 +1,38 @@
 import tensorflow as tf 
 from tensorflow import keras
 
-def create_simple_conv(input_dim, output_dim, actv='relu', output_actv=None, name='conv'):
-    	
+def create_simple_conv(input_dim, output_dim, actv='relu', output_actv='linear', seed_i=222, name='conv'):
+    inits = keras.initializers.RandomNormal(mean=0.0, stddev=0.1, seed=seed_i) 
+
     ins = keras.layers.Input(shape=input_dim)
-    x = keras.layers.Conv2D(filters=32, kernel_size=(4, 4), strides=(3, 3), activation=actv, use_bias=True)(ins)
-    x = keras.layers.Conv2D(filters=32, kernel_size=(4, 4), strides=(2, 2), activation=actv, use_bias=True)(x)
-    x = keras.layers.Conv2D(filters=32, kernel_size=(3, 3), strides=(2, 2), activation=actv, use_bias=True)(x)
+    x = keras.layers.Conv2D(filters=64, kernel_size=(6, 6), strides=(2, 2), activation=actv, use_bias=True,
+            kernel_initializer=inits, bias_initializer='zeros')(ins)
+    x = keras.layers.Conv2D(filters=64, kernel_size=(4, 4), strides=(2, 2), activation=actv, use_bias=True,
+            kernel_initializer=inits, bias_initializer='zeros')(x)
+    x = keras.layers.Conv2D(filters=64, kernel_size=(4, 4), strides=(2, 2), activation=actv, use_bias=True,
+            kernel_initializer=inits, bias_initializer='zeros')(x)
     x = keras.layers.Flatten()(x)
-    x = keras.layers.Dense(32, activation=actv)(x)
+    x = keras.layers.Dense(300, activation=actv)(x)
+    out = keras.layers.Dense(output_dim, activation=output_actv)(x)
+
+    return keras.Model(ins, out)
+    
+def create_simple_conv_low(input_dim, output_dim, actv='relu', output_actv='sigmoid', seed_i=222, name='conv'):
+    inits = keras.initializers.RandomNormal(mean=0.0, stddev=0.1, seed=seed_i) 
+
+    ins = keras.layers.Input(shape=input_dim)
+    x = keras.layers.Conv2D(filters=64, kernel_size=(6, 6), strides=(3, 3), activation=actv, use_bias=True,
+            kernel_initializer=inits, bias_initializer='zeros')(ins)
+    x = keras.layers.Conv2D(filters=64, kernel_size=(4, 4), strides=(3, 3), activation=actv, use_bias=True,
+            kernel_initializer=inits, bias_initializer='zeros')(x)
+    x = keras.layers.Conv2D(filters=64, kernel_size=(4, 4), strides=(3, 3), activation=actv, use_bias=True,
+            kernel_initializer=inits, bias_initializer='zeros')(x)
+    x = keras.layers.Flatten()(x)
+    x = keras.layers.Dense(64, activation=actv)(x)
     out = keras.layers.Dense(output_dim, activation=output_actv)(x)
 
     return keras.Model(ins, out)
 
-    return keras.Model(ins, out)
-		
 def conv_rs(x, n_hidden=3, filters=128, kernel=(3, 3), stride=(2, 2), act='sigmoid', b=True, flatten=False):
     for i in range(n_hidden):
         x = tf.keras.layers.Conv2D(filters, kernel, stride, activation=act, use_bias=b)(x)

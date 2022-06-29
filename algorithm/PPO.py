@@ -1,38 +1,42 @@
 from base_agent import ActorCritic
-from runner import GymRunner
+from runner import GymRunner, GymRunnerStack
 from utils import *
 from distributions import *
 
 import tensorflow as tf
 import warnings
 
-class PPO(ActorCritic):
+class ProximalPG(ActorCritic):
 
-    def __init__(self, env, policy, value_network=None, gamma=0.90, max_trj=3000, summary=True, clip_ratio= 0.4, kl_beta=0.0, kl_target=0.01,
-            kl_tol=2, kl_low=1.5, kl_cutoff=0.1, optimizer=None, grad_clip_norm=1., policy_lr=0.009, value_lr=0.01, 
-            use_gae=True, lam=0.9):
+    def __init__(self, env, policy, value_network=None, gamma=0.98, max_trj=3000, summary=True, clip_ratio= 2., kl_beta=3, kl_target=0.0001,
+            kl_tol=2, kl_low=1.5, kl_cutoff=0.0000, optimizer=None, grad_clip_norm=2., policy_lr=0.001, value_lr=0.01, 
+            use_gae=True, lam=0.93):
         
         super().__init__(env, policy, value_network, gamma, summary, optimizer, grad_clip_norm, policy_lr, value_lr, use_gae, lam)
-        self.entropy_rate = 0.05
-        self.kl_penalty = 0.0
+        self.entropy_rate = 0.1
         self.optimizer = tf.keras.optimizers.Adam(self._policy_lr)
         self.max_trj = max_trj
         self.pol_iters = 80
-        self.entropy_rate = 0.1
+        self.value_loss_const = 0.1
 
-        self.clip_ratio = clip_ratio or 0.0
-        self.kl_beta = kl_beta or 0.0 
-        self.kl_target = kl_target or 0.01
-        self.kl_tol = kl_tol or 2
-        self.kl_low = kl_low or 1.5
-        self.cutoff = kl_cutoff or 0.1
+        self.clip_ratio = clip_ratio 
+        self.kl_beta = kl_beta 
+        self.kl_target = kl_target 
+        self.kl_tol = kl_tol 
+        self.kl_low = kl_low 
+        self.cutoff = kl_cutoff 
         self.cut_const = 0.1
+        self.step_runner = tf.Variable(0, dtype=tf.int64, name='step_runner')
+        self.model_save_dir = 'ppo_model'
         
         if self.clip_ratio == 0. and self.kl_beta == 0.:
             warnings.warn('clip ratio and kl_penalty is both zero, this is equivalent for using VG class')
 
     def _forward_trajectory(self, max_step=100):
-        TRJ = GymRunner(self.env, self.policy, max_step)
+        if self.stack < 1:
+            TRJ = GymRunner(self.env, self.policy, max_step, self.step_runner)
+        else:
+            TRJ = GymRunnerStack(self.env, self.policy, max_step, self.step_runner, self.stack)
         return TRJ
 
     def _train(self, epochs=30):
@@ -40,7 +44,7 @@ class PPO(ActorCritic):
         for ep in range(epochs):
     
             DATA = self.preprocess_data(max_trj=self.max_trj, validate_trj=True, compute_log_prob=True)
-
+            
             var_to_train = self.value_network.trainable_variables + self.policy.network.trainable_variables
             assert var_to_train, 'no variable is initialized'
             m_V, m_P, m_L, m_ng, m_et, m_kl = [], [], [], [], [], []
@@ -52,8 +56,9 @@ class PPO(ActorCritic):
                     LOSS = v_loss_k * self.value_loss_const + p_loss_k
                 grads = tape.gradient(LOSS, var_to_train)
                 assert grads, 'gradient cannot be computed'
+
                 if self.grad_clip_norm:
-                    grads = tf.clip_by_global_norm(grads, self.grad_clip_norm)
+                    grads, g_norm = tf.clip_by_global_norm(grads, self.grad_clip_norm)
 
                 self.optimizer.apply_gradients(zip(grads, var_to_train))
 
@@ -64,6 +69,10 @@ class PPO(ActorCritic):
                 m_et.append(ent1)
                 m_kl.append(kl1)
 
+                if self.kl_beta > 0.:
+                    self.update_kl_beta(kl1)
+                    tf.summary.scalar('kl_beta', self.kl_beta, self.train_step_counter)
+                    
             if self.summary:
 
                 grad_norm = tf.reduce_mean(m_ng)
@@ -87,11 +96,9 @@ class PPO(ActorCritic):
                     tf.summary.scalar('stepsize', p, self.train_step_counter)
             
             self.train_step_counter.assign_add(1)
-
-    def get_all_loss(self, obs, act, adv, lp0, ret):
-        V_LOSS = self.policy_Loss(obs, act, adv, lp0)
-        P_LOSS = self.value_loss(obs, ret, training=True)
-
+            self.policy.save_model(self.model_save_dir)
+            print('------------------------EPOCH--------------------------------')
+            
     def policy_loss(self, S_batch, A_batch, ADV_b, log_prob0, summary=True):
 
         logit1 = self.policy.forward_network(S_batch)
@@ -122,11 +129,11 @@ class PPO(ActorCritic):
         else:
             p_reg_loss = 0.   
         if self.kl_beta > 0:
-            kl_penalty = self.kl_penalty(params0=self.old_logits, params1=logit1, obs=None)
+            kl_penalty = self.kl_penalty_loss(params0=self.old_logits, params1=logit1, obs=None)
         else:
             kl_penalty = 0.
         if self.entropy_rate >0.:
-            ent = self.entropy_loss(A_batch, logit1)
+            ent = self.entropy_loss()
         else:
             ent = 0.
 
@@ -134,18 +141,18 @@ class PPO(ActorCritic):
         if summary:
             tf.summary.scalar('total_p_loss', total_p_loss, self.train_step_counter)
             tf.summary.scalar('p_loss', p_loss, self.train_step_counter)
-            tf.summary.scalar('ratio', ratio, self.train_step_counter)
-            tf.summary.scalar('clipped_ratio', clipped, self.train_step_counter)
+            tf.summary.scalar('ratio', tf.reduce_mean(ratio), self.train_step_counter)
+            tf.summary.scalar('clipped_ratio', tf.reduce_mean(clipped), self.train_step_counter)
         
         return total_p_loss, log_prob1, ent, kl_penalty
 
-    def entropy_loss(self, actions, logits=None, summary=False):
+    def entropy_loss(self, logits=None, summary=False):
         if self.entropy_rate > 0:
             with tf.name_scope('entropy_regularization'):
                 if logits is not None:
-                    self.policy.distribution.assign_logit(logits)
-                entropy = self.policy.distribution.entropy(actions)
-                entropy = - tf.reduce_mean(entropy * self.entropy_rate)
+                    self.policy.distribution.assign_logits(logits)
+                entropy = self.policy.distribution.entropy()
+                entropy = tf.reduce_mean(entropy * self.entropy_rate)
                 entropy = tf.debugging.check_numerics(entropy, 'entropy_reg')
             if summary:
                 tf.summary.histogram('entropy_reg', entropy, self.train_step_counter)		
@@ -153,10 +160,10 @@ class PPO(ActorCritic):
             entropy = tf.constant(0.0, dtype=tf.float32)	
         return entropy * self.entropy_rate
 
-    def kl_penalty(self, params0=None, params1=None, obs=None, summary=True):
+    def kl_penalty_loss(self, params0=None, params1=None, obs=None, summary=True):
         if obs is not None and params1 is None:
             params1 = self.policy.forward_network(obs, training=True)
-            self.policy.distribution.assign_logits(params1)
+            #self.policy.distribution.assign_logits(params1)
 
         if self.env.action_spec.is_discrete():
             kls = Cat_KL(params0, params1)
@@ -170,28 +177,25 @@ class PPO(ActorCritic):
         if self.cutoff > 0.:
             CoF = self.kl_target * self.cutoff
             KL_CoF = tf.maximum(kl_pt - CoF, 0.)
-            cutL = self.cut_off * tf.math.square(KL_CoF)
+            cutL = self.cutoff * tf.math.square(KL_CoF)
             kl_pt += cutL
-            tf.summary.scalar('kl_cutoff_count', tf.reduce_sum(tf.cast(kls > CoF)), self.train_step_counter)
-            tf.summary.scalr('cut_off_loss', cutL, self.train_step_counter)
-        if summary:
-            tf.summary.scalar('kl_penalty', KL_CoF, self.train_step_counter)
+            tf.summary.scalar('kl_cutoff_count', tf.reduce_sum(tf.cast(kls > CoF, dtype=tf.float32)), self.train_step_counter)
+            tf.summary.scalar('cut_off_loss', cutL, self.train_step_counter)
+            tf.summary.scalar('kl_penalty_cut', KL_CoF, self.train_step_counter)
         
         return kl_pt     
 
-    def update_kl_beta(self, mean_kl, summary=True):
-        if self.kl_beta is None:
+    def update_kl_beta(self, mean_kl):
+        if self.kl_beta ==0:
             return tf.no_op()
-        c1 = mean_kl < self.kl_target / self.kl_low
-        c2 = mean_kl > self.kl_target * self.kl_low
-        if c1 == True:
+
+        if mean_kl < self.kl_target / self.kl_low: # do not satisfied, increase penalty
             new_beta = self.kl_beta / self.kl_tol
-        elif c2 == True:
-            new_beta = self.kl_beta * self.kl_tol
+
+        elif mean_kl > self.kl_target * self.kl_low: # satisfied, decrease penalty
+            new_beta = self.kl_beta * self.kl_tol 
         else:
             new_beta = self.kl_beta
-        new_beta = tf.maximum(new_beta, 10e-16)
-        self.kl_beta = new_beta.numpy()
 
-        if summary:
-            tf.summary.scalar('kl_beta', self.kl_beta, self.train_step_counter)
+        new_beta = tf.maximum(new_beta, 10e-10)
+        self.kl_beta = new_beta.numpy()

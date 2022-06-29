@@ -1,23 +1,28 @@
 from base_agent import ActorCritic
-from runner import GymRunner
+from runner import GymRunner, GymRunnerStack
 from utils import *
 
 import tensorflow as tf
 
 class VanillaPG(ActorCritic):
 
-    def __init__(self, env, policy, value_network=None, gamma=0.90, max_trj=3000, summary=True, optimizer=None, 
-            grad_clip_norm=1., policy_lr=0.001, value_lr=0.01, use_gae=True, lam=0.9):
+    def __init__(self, env, policy, value_network=None, gamma=0.98, max_trj=3000, summary=True, optimizer=None, 
+            grad_clip_norm=2., policy_lr=0.001, value_lr=0.01, use_gae=True, lam=0.95):
         super().__init__(env, policy, value_network, gamma, summary, optimizer, grad_clip_norm, policy_lr, value_lr, use_gae, lam)
-        self.entropy_rate = 0.05
+        self.entropy_rate = 0.1
         self.kl_penalty = 0.0
         self.optimizer = tf.keras.optimizers.Adam(self._policy_lr)
         self.max_trj = max_trj
         self.pol_iters = 80
-        self.value_loss_const = 0.5
-
+        self.value_loss_const = 1.
+        self.step_runner = tf.Variable(0, dtype=tf.int64, name='step_runner')
+        self.model_save_dir = 'vg_model'
+        
     def _forward_trajectory(self, max_step=100):
-        TRJ = GymRunner(self.env, self.policy, max_step)
+        if self.stack < 1:
+            TRJ = GymRunner(self.env, self.policy, max_step, self.step_runner)
+        else:
+            TRJ = GymRunnerStack(self.env, self.policy, max_step, self.step_runner, self.stack)
         return TRJ
 
     def _train(self, epochs=30):
@@ -36,11 +41,14 @@ class VanillaPG(ActorCritic):
                     LOSS = v_loss_k * self.value_loss_const + p_loss_k
                 grads = tape.gradient(LOSS, var_to_train)
                 assert grads, 'gradient cannot be computed'
+                if self.grad_clip_norm:
+                    grads, grad_norm = tf.clip_by_global_norm(grads, self.grad_clip_norm)
+                else:
+                    grad_norm = norm_x(grads)
                 self.optimizer.apply_gradients(zip(grads, var_to_train))
             
-            if self.summary:
+            if self.summary: # this is the lasted summary not average
 
-                grad_norm = norm_x(grads)
                 p_params_norm = tf.norm(self.policy.get_variable(flatten=True))
                 v_params_norm = tf.norm(flatten_shape(self.value_network.trainable_variables))
                 tf.summary.scalar('grad_norm', grad_norm, self.train_step_counter)
@@ -55,6 +63,9 @@ class VanillaPG(ActorCritic):
                 tf.summary.scalar('log_prob_ratio', log_prob_ratio, self.train_step_counter)
 
             self.train_step_counter.assign_add(1)
+            self.policy.save_model(self.model_save_dir)
+            print('-----------------------EPOCH--------------------------')
+
 
     def policy_loss(self, S_batch, A_batch, ADV_b):
 
@@ -72,7 +83,6 @@ class VanillaPG(ActorCritic):
         
         if self.entropy_rate > 0.:
             ent = tf.reduce_mean(self.policy.distribution.entropy())
-            total_p_loss = p_loss + self.entropy_rate * ent
             tf.summary.scalar('entropy', ent, self.train_step_counter)
         else:
             ent = 0.
